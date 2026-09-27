@@ -44,6 +44,15 @@ Run this after non-trivial changes to `set_jurisdiction` /
 `get_jurisdiction` / `is_permitted_jurisdiction`, or as part of a release
 checklist. Failures print the failing `seed` so the sequence is reproducible.
 
+### Expiring jurisdiction entries (#397)
+
+Boundary fuzz coverage for `set_jurisdiction_until` is blocked: the current
+contract has no such entrypoint, `valid_until` value, or expiry storage. Once
+expiry semantics are implemented, add checks for `valid_until` equal to zero,
+the current ledger sequence, values near `u32::MAX`, and randomized values;
+assert that only the documented `Error` results are returned for invalid
+boundaries. See #397 for the requested follow-up.
+
 ## policy-engine (`#234`)
 
 Harness: `contracts/policy-engine/src/fuzz.rs`
