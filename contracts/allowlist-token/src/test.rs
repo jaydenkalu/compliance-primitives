@@ -36,6 +36,93 @@ fn setup(env: &Env) -> (Address, Address, Address, AllowlistTokenClient<'_>) {
     (admin, token_id, contract_id, client)
 }
 
+// ─── Budget baseline helpers ─────────────────────────────────────────────────
+
+fn read_baseline(path: &Path, section: &str) -> (u64, u64) {
+    let contents = std::fs::read_to_string(path).unwrap();
+    let section_header = format!("[{section}]");
+    let mut in_section = false;
+    let mut cpu = None;
+    let mut memory = None;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_section = trimmed == section_header;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("cpu = ") {
+            cpu = Some(value.parse::<u64>().unwrap());
+        } else if let Some(value) = trimmed.strip_prefix("memory = ") {
+            memory = Some(value.parse::<u64>().unwrap());
+        }
+    }
+
+    let cpu = cpu.expect("missing cpu baseline");
+    let memory = memory.expect("missing memory baseline");
+    (cpu, memory)
+}
+
+fn baseline_path_for_manifest_dir(manifest_dir: PathBuf) -> PathBuf {
+    manifest_dir.join("..").join("..").join("budget-baselines.toml")
+}
+
+fn assert_budget_within_threshold(measured: (u64, u64), baseline: (u64, u64), label: &str) {
+    let (measured_cpu, measured_memory) = measured;
+    let (baseline_cpu, baseline_memory) = baseline;
+    let cpu_limit = (baseline_cpu as f64 * 1.10).ceil() as u64;
+    let memory_limit = (baseline_memory as f64 * 1.10).ceil() as u64;
+
+    assert!(
+        measured_cpu <= cpu_limit,
+        "{label} CPU regression: measured {measured_cpu}, baseline {baseline_cpu}, limit {cpu_limit}"
+    );
+    assert!(
+        measured_memory <= memory_limit,
+        "{label} memory regression: measured {measured_memory}, baseline {baseline_memory}, limit {memory_limit}"
+    );
+}
+
+// ─── Delegated-signature helpers ─────────────────────────────────────────────
+
+fn delegated_message_bytes(env: &Env, target: &Address, nonce: u64, expiry: u64) -> Bytes {
+    let mut message = Bytes::new(env);
+    message.append(&Bytes::from_slice(env, b"allowlist-delegated-v1:"));
+    let target_str = target.to_string().to_string();
+    message.append(&Bytes::from_slice(env, target_str.as_bytes()));
+    message.push_back(b':');
+    message.append(&Bytes::from_slice(env, b"add_to_allowlist"));
+    message.push_back(b':');
+    let nonce_str = nonce.to_string();
+    message.append(&Bytes::from_slice(env, nonce_str.as_bytes()));
+    message.push_back(b':');
+    let expiry_str = expiry.to_string();
+    message.append(&Bytes::from_slice(env, expiry_str.as_bytes()));
+    message
+}
+
+fn sign_delegated_action(
+    env: &Env,
+    signing_key: &SigningKey,
+    target: &Address,
+    nonce: u64,
+    expiry: u64,
+) -> BytesN<64> {
+    let message = delegated_message_bytes(env, target, nonce, expiry);
+    let sig = signing_key.sign(&message).unwrap();
+    BytesN::from_array(env, &sig)
+}
+
+fn delegated_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[
+        0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+        23, 24, 25, 26, 27, 28, 29, 30, 31,
+    ])
+}
+
 // ─── Existing unit tests ──────────────────────────────────────────────────────
 
 #[test]
@@ -88,6 +175,74 @@ fn test_budget_regression_allowlist_transfer() {
     let baseline_path = baseline_path_for_manifest_dir(PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()));
     let baseline = read_baseline(&baseline_path, "allowlist-token.transfer");
     assert_budget_within_threshold(measured, baseline, "allowlist-token transfer");
+}
+
+#[test]
+fn test_budget_regression_allowlist_add_to_allowlist() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+
+    let mut budget = env.cost_estimate().budget();
+    budget.reset_default();
+    client.add_to_allowlist(&admin, &alice);
+
+    let measured = (budget.cpu_instruction_cost(), budget.memory_bytes_cost());
+    let baseline_path = baseline_path_for_manifest_dir(PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()));
+    let baseline = read_baseline(&baseline_path, "allowlist-token.add_to_allowlist");
+    assert_budget_within_threshold(measured, baseline, "allowlist-token add_to_allowlist");
+}
+
+#[test]
+fn test_budget_regression_allowlist_add_to_allowlist_delegated() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let signing_key = delegated_signing_key();
+    let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    client.set_delegated_admin_key(&admin, &pubkey);
+
+    let expiry = env.ledger().timestamp() + 60;
+    let signature = sign_delegated_action(&env, &signing_key, &alice, 1, expiry);
+
+    let mut budget = env.cost_estimate().budget();
+    budget.reset_default();
+    client.add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &signature);
+
+    let measured = (budget.cpu_instruction_cost(), budget.memory_bytes_cost());
+    let baseline_path = baseline_path_for_manifest_dir(PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()));
+    let baseline = read_baseline(&baseline_path, "allowlist-token.add_to_allowlist_delegated");
+    assert_budget_within_threshold(measured, baseline, "allowlist-token add_to_allowlist_delegated");
+}
+
+/// The delegated path (ed25519 verification plus nonce/pubkey storage access)
+/// must cost more CPU than the direct-auth baseline it is compared against.
+#[test]
+fn test_delegated_add_costs_more_cpu_than_direct_add() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let signing_key = delegated_signing_key();
+    let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    client.set_delegated_admin_key(&admin, &pubkey);
+
+    let expiry = env.ledger().timestamp() + 60;
+    let signature = sign_delegated_action(&env, &signing_key, &bob, 1, expiry);
+
+    let mut budget = env.cost_estimate().budget();
+    budget.reset_default();
+    client.add_to_allowlist(&admin, &alice);
+    let direct_cpu = budget.cpu_instruction_cost();
+
+    budget.reset_default();
+    client.add_to_allowlist_delegated(&admin, &bob, &1u64, &expiry, &signature);
+    let delegated_cpu = budget.cpu_instruction_cost();
+
+    assert!(
+        delegated_cpu > direct_cpu,
+        "delegated add ({delegated_cpu} cpu) should cost more than direct add ({direct_cpu} cpu)"
+    );
 }
 
 #[test]
