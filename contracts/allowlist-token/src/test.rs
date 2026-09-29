@@ -631,3 +631,154 @@ fn prop_allowlist_add_remove_last_write_wins() {
         )
         .unwrap();
 }
+
+// ─── Compliance officer (#357) ───────────────────────────────────────────────
+
+#[test]
+fn test_officer_can_remove_from_allowlist_after_assignment() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+    let alice = Address::generate(&env);
+
+    client.add_to_allowlist(&admin, &alice);
+    client.set_compliance_officer(&admin, &officer);
+
+    client.remove_from_allowlist(&officer, &alice);
+    assert!(!client.is_allowed(&alice));
+}
+
+#[test]
+fn test_officer_cannot_assign_or_revoke_officer_role() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+    let other = Address::generate(&env);
+
+    client.set_compliance_officer(&admin, &officer);
+
+    assert_eq!(
+        client.try_set_compliance_officer(&officer, &other),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_revoke_compliance_officer(&officer),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn test_officer_cannot_add_to_allowlist() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+    let alice = Address::generate(&env);
+
+    client.set_compliance_officer(&admin, &officer);
+
+    assert_eq!(
+        client.try_add_to_allowlist(&officer, &alice),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(!client.is_allowed(&alice));
+}
+
+#[test]
+fn test_revoked_officer_can_no_longer_remove_from_allowlist() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+    let alice = Address::generate(&env);
+
+    client.add_to_allowlist(&admin, &alice);
+    client.set_compliance_officer(&admin, &officer);
+    client.revoke_compliance_officer(&admin);
+
+    assert_eq!(
+        client.try_remove_from_allowlist(&officer, &alice),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(client.is_allowed(&alice));
+}
+
+// ─── Pause / unpause / is_paused (#358) ──────────────────────────────────────
+
+#[test]
+fn test_transfer_blocked_while_paused_and_succeeds_after_unpause() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice);
+    client.add_to_allowlist(&admin, &bob);
+
+    assert!(!client.is_paused());
+    client.pause(&admin);
+    assert!(client.is_paused());
+    assert_eq!(
+        client.try_transfer(&alice, &bob, &10),
+        Err(Ok(Error::ContractPaused))
+    );
+
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+    assert!(client.transfer(&alice, &bob, &10));
+    let token = MockTokenClient::new(&env, &token_id);
+    assert_eq!(token.last_transfer(), Some((alice, bob, 10)));
+}
+
+#[test]
+fn test_pause_does_not_block_allowlist_mutations() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice);
+
+    client.pause(&admin);
+
+    client.add_to_allowlist(&admin, &bob);
+    assert!(client.is_allowed(&bob));
+    client.remove_from_allowlist(&admin, &alice);
+    assert!(!client.is_allowed(&alice));
+}
+
+#[test]
+fn test_pause_and_unpause_reject_non_admin() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let impostor = Address::generate(&env);
+
+    assert_eq!(client.try_pause(&impostor), Err(Ok(Error::NotAuthorized)));
+    assert!(!client.is_paused());
+
+    client.pause(&admin);
+    assert_eq!(client.try_unpause(&impostor), Err(Ok(Error::NotAuthorized)));
+    assert!(client.is_paused());
+}
+
+// ─── get_delegated_nonce (#359) ──────────────────────────────────────────────
+
+#[test]
+fn test_get_delegated_nonce_is_zero_before_any_delegated_call() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+
+    assert_eq!(client.get_delegated_nonce(&admin), 0);
+}
+
+#[test]
+fn test_get_delegated_nonce_returns_last_used_nonce() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let signing_key = delegated_signing_key();
+    let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    client.set_delegated_admin_key(&admin, &pubkey);
+
+    let expiry = env.ledger().timestamp() + 60;
+    let signature = sign_delegated_action(&env, &signing_key, &alice, 7, expiry);
+    client.add_to_allowlist_delegated(&admin, &alice, &7u64, &expiry, &signature);
+
+    assert_eq!(client.get_delegated_nonce(&admin), 7);
+}

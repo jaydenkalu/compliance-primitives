@@ -15,6 +15,40 @@
 //! and point clients at it instead of the underlying token — cleared
 //! transfers are forwarded on via a cross-contract call.
 //!
+//! **Roles**: `admin` is the primary privileged role. `add_to_allowlist`
+//! (and `add_to_allowlist_delegated`) are admin-only. An optional
+//! compliance officer, assigned with `set_compliance_officer` and removed
+//! with `revoke_compliance_officer` (both admin-only), may call
+//! `remove_from_allowlist` but can never grant access or manage roles.
+//!
+//! **Delegated actions**: `add_to_allowlist_delegated` lets a relayer submit
+//! an allowlist addition on the admin's behalf, without the admin account
+//! signing the transaction. The admin first registers an ed25519 public key
+//! with `set_delegated_admin_key`. The holder of the matching private key then
+//! signs the payload
+//! `allowlist-delegated-v1:<target>:add_to_allowlist:<nonce>:<expiry>`, where
+//! `<target>` is the address being allowlisted, `<nonce>` is a `u64` and
+//! `<expiry>` is a ledger timestamp in seconds. Each admin has a
+//! replay-protection nonce: a call is rejected with `InvalidNonce` unless
+//! `nonce` is strictly greater than the last accepted one (readable via
+//! `get_delegated_nonce`), and with `ExpiredSignature` once the ledger
+//! timestamp reaches `expiry`. Use this path when the admin key is kept
+//! offline or in cold storage and a relayer pays the fees; use the direct
+//! path (`admin.require_auth()`) whenever the admin can sign the transaction
+//! itself.
+#![no_std]` Soroban contract that wraps an existing
+//! SEP-41 token and only permits `transfer` calls between two addresses that
+//! are both present on an on-chain allowlist.
+//!
+//! **Purpose**: give issuers of permissioned tokens (e.g. RWA or regulated
+//! stablecoins) a drop-in gate that blocks transfers to or from addresses
+//! that haven't cleared KYC/onboarding, without modifying the underlying
+//! token contract's own logic.
+//!
+//! **Composition**: deploy this contract in front of an issuer's real token
+//! and point clients at it instead of the underlying token — cleared
+//! transfers are forwarded on via a cross-contract call.
+//!
 //! **Roles**: there is a single privileged role, `admin`. Both
 //! `add_to_allowlist` and `remove_from_allowlist` are admin-only, and this
 //! contract has no compliance-officer role (that role exists only on
@@ -42,6 +76,8 @@ pub(crate) const ALLOWED_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
 enum DataKey {
     /// The admin address, set once in `initialize`. Instance storage.
     Admin,
+    /// Optional compliance officer, who may revoke allowlist entries. Instance storage.
+    ComplianceOfficer,
     Token,
     Allowed(Address),
     Paused,
@@ -168,15 +204,11 @@ impl AllowlistToken {
 
     /// Add `address` to the allowlist. Admin-only.
     ///
-    /// Granting access is deliberately stricter than revoking it in intent:
-    /// putting an address on the allowlist lets it receive and send the
-    /// wrapped token, so it is restricted to the `admin` (directly, or through
-    /// `add_to_allowlist_delegated`). `remove_from_allowlist` is also
-    /// admin-only today — this contract has no compliance-officer role, so
-    /// there is no add/remove asymmetry to preserve. Do not "unify" the two
-    /// gates without deciding that explicitly: if a compliance-officer role is
-    /// introduced, the intended shape is that officers may revoke access but
-    /// never grant it, so `add_to_allowlist` must stay admin-only.
+    /// Granting access is deliberately stricter than revoking it: putting an
+    /// address on the allowlist lets it receive and send the wrapped token, so
+    /// it is restricted to the `admin` (directly, or through
+    /// `add_to_allowlist_delegated`). The compliance officer may revoke access
+    /// via `remove_from_allowlist` but never grant it.
     pub fn add_to_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         let key = DataKey::Allowed(address.clone());
@@ -248,17 +280,40 @@ impl AllowlistToken {
         Ok(())
     }
 
-    /// Remove `address` from the allowlist. Admin-only.
-    ///
-    /// Same gate as `add_to_allowlist` (`require_admin`); see the note there
-    /// on why revocation must not be widened to other roles by accident.
+    /// Remove `address` from the allowlist. Admin or compliance officer.
     pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
+        Self::require_compliance_authority(&env, &admin)?;
         env.storage()
             .persistent()
             .remove(&DataKey::Allowed(address.clone()));
         AllowRemove { address }.publish(&env);
         Ok(())
+    }
+
+    /// Assign the compliance-officer role. Admin-only.
+    pub fn set_compliance_officer(env: Env, admin: Address, officer: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::ComplianceOfficer, &officer);
+        Ok(())
+    }
+
+    /// Revoke the compliance-officer role. Admin-only.
+    pub fn revoke_compliance_officer(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().remove(&DataKey::ComplianceOfficer);
+        Ok(())
+    }
+
+    /// Returns the last-used delegated-action nonce for `admin`, or 0 if none
+    /// has been used. A relayer should sign its next payload with a nonce
+    /// strictly greater than this value.
+    pub fn get_delegated_nonce(env: Env, admin: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DelegatedNonce(admin))
+            .unwrap_or(0)
     }
 
     /// Propose a new admin. The current admin remains active until the
@@ -448,6 +503,29 @@ impl AllowlistToken {
             return Err(Error::NotAuthorized);
         }
         Ok(())
+    }
+
+    /// Checks that `caller` is either the admin or the compliance officer.
+    fn require_compliance_authority(env: &Env, caller: &Address) -> Result<(), Error> {
+        caller.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if stored_admin == *caller {
+            return Ok(());
+        }
+        if let Some(officer) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::ComplianceOfficer)
+        {
+            if officer == *caller {
+                return Ok(());
+            }
+        }
+        Err(Error::NotAuthorized)
     }
 
     /// Message signed by the delegated admin key:
