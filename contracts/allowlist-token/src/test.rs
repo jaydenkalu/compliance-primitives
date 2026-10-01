@@ -132,7 +132,7 @@ fn test_initialize_and_allowlist_roundtrip() {
     let alice = Address::generate(&env);
 
     assert!(!client.is_allowed(&alice));
-    client.add_to_allowlist(&admin, &alice);
+    client.add_to_allowlist(&admin, &alice, &None);
     assert!(client.is_allowed(&alice));
     client.remove_from_allowlist(&admin, &alice);
     assert!(!client.is_allowed(&alice));
@@ -145,8 +145,8 @@ fn test_transfer_forwards_to_underlying_token_when_both_allowlisted() {
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
 
-    client.add_to_allowlist(&admin, &alice);
-    client.add_to_allowlist(&admin, &bob);
+    client.add_to_allowlist(&admin, &alice, &None);
+    client.add_to_allowlist(&admin, &bob, &None);
 
     let ok = client.transfer(&alice, &bob, &500);
     assert!(ok);
@@ -163,8 +163,8 @@ fn test_budget_regression_allowlist_transfer() {
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
 
-    client.add_to_allowlist(&admin, &alice);
-    client.add_to_allowlist(&admin, &bob);
+    client.add_to_allowlist(&admin, &alice, &None);
+    client.add_to_allowlist(&admin, &bob, &None);
 
     let mut budget = env.cost_estimate().budget();
     budget.reset_default();
@@ -252,14 +252,17 @@ fn test_transfer_blocked_when_recipient_not_allowlisted() {
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
 
-    client.add_to_allowlist(&admin, &alice);
+    client.add_to_allowlist(&admin, &alice, &None);
 
     let ok = client.transfer(&alice, &bob, &500);
     assert!(!ok);
 
-    assert_eq!(
-        env.events().all(),
-        vec![
+    // `assert_events_eq` pretty-prints both the actual and expected events on
+    // mismatch instead of a single-line raw XDR dump.
+    compliance_test_trace::assert_events_eq(
+        &env,
+        &env.events().all(),
+        &vec![
             &env,
             (
                 contract_id.clone(),
@@ -272,7 +275,7 @@ fn test_transfer_blocked_when_recipient_not_allowlisted() {
                 Map::<Symbol, Val>::from_array(&env, [(symbol_short!("amount"), 500i128.into_val(&env))])
                     .into_val(&env),
             ),
-        ]
+        ],
     );
 }
 
@@ -283,7 +286,7 @@ fn test_add_to_allowlist_rejects_non_admin() {
     let impostor = Address::generate(&env);
     let alice = Address::generate(&env);
 
-    let result = client.try_add_to_allowlist(&impostor, &alice);
+    let result = client.try_add_to_allowlist(&impostor, &alice, &None);
     assert_eq!(result, Err(Ok(Error::NotAuthorized)));
     assert!(!client.is_allowed(&alice));
 }
@@ -295,11 +298,11 @@ fn test_non_admin_allowlist_mutations_rejected_end_to_end() {
     let impostor = Address::generate(&env);
     let alice = Address::generate(&env);
 
-    let add_result = client.try_add_to_allowlist(&impostor, &alice);
+    let add_result = client.try_add_to_allowlist(&impostor, &alice, &None);
     assert_eq!(add_result, Err(Ok(Error::NotAuthorized)));
     assert!(!client.is_allowed(&alice));
 
-    client.add_to_allowlist(&admin, &alice);
+    client.add_to_allowlist(&admin, &alice, &None);
     assert!(client.is_allowed(&alice));
 
     let remove_result = client.try_remove_from_allowlist(&impostor, &alice);
@@ -462,7 +465,7 @@ fn test_add_to_allowlist_emits_allow_add_event() {
     let (admin, _token_id, contract_id, client) = setup(&env);
     let alice = Address::generate(&env);
 
-    client.add_to_allowlist(&admin, &alice);
+    client.add_to_allowlist(&admin, &alice, &None);
 
     assert_eq!(
         env.events().all(),
@@ -482,7 +485,7 @@ fn test_remove_from_allowlist_emits_allow_remove_event() {
     let env = Env::default();
     let (admin, _token_id, contract_id, client) = setup(&env);
     let alice = Address::generate(&env);
-    client.add_to_allowlist(&admin, &alice);
+    client.add_to_allowlist(&admin, &alice, &None);
 
     client.remove_from_allowlist(&admin, &alice);
 
@@ -519,7 +522,7 @@ fn test_add_to_allowlist_extends_persistent_ttl() {
     let (admin, _token_id, contract_id, client) = setup(&env);
     let alice = Address::generate(&env);
 
-    client.add_to_allowlist(&admin, &alice);
+    client.add_to_allowlist(&admin, &alice, &None);
 
     env.as_contract(&contract_id, || {
         let ttl = env
@@ -548,7 +551,7 @@ fn test_add_to_allowlist_extends_persistent_ttl() {
         );
     });
 
-    client.add_to_allowlist(&admin, &alice);
+    client.add_to_allowlist(&admin, &alice, &None);
     env.as_contract(&contract_id, || {
         let ttl = env
             .storage()
@@ -607,7 +610,7 @@ fn prop_allowlist_add_remove_last_write_wins() {
                 for op in &ops {
                     match *op {
                         Op::Add(i) => {
-                            client.add_to_allowlist(&admin, &addresses[i]);
+                            client.add_to_allowlist(&admin, &addresses[i], &None);
                             model[i] = true;
                         }
                         Op::Remove(i) => {

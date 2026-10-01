@@ -44,6 +44,15 @@ Run this after non-trivial changes to `set_jurisdiction` /
 `get_jurisdiction` / `is_permitted_jurisdiction`, or as part of a release
 checklist. Failures print the failing `seed` so the sequence is reproducible.
 
+### Expiring jurisdiction entries (#397)
+
+Boundary fuzz coverage for `set_jurisdiction_until` is blocked: the current
+contract has no such entrypoint, `valid_until` value, or expiry storage. Once
+expiry semantics are implemented, add checks for `valid_until` equal to zero,
+the current ledger sequence, values near `u32::MAX`, and randomized values;
+assert that only the documented `Error` results are returned for invalid
+boundaries. See #397 for the requested follow-up.
+
 ## policy-engine (`#234`)
 
 Harness: `contracts/policy-engine/src/fuzz.rs`
@@ -83,3 +92,52 @@ FUZZ_ITERATIONS=2000 FUZZ_OPS=64 \
 Run this after non-trivial changes to `add_check` / `remove_check` /
 `evaluate`, or as part of a release checklist. Failures print the failing
 `seed` so the exact failing sequence is fully reproducible.
+
+## allowlist-token (`#22`)
+
+Harness: `contracts/allowlist-token/src/fuzz.rs`
+
+**Why a seeded-PRNG loop instead of `cargo-fuzz` or `proptest`:** it matches
+the other harnesses in this repo, runs on the stable toolchain as part of
+`cargo test` with no extra dependencies, and prints the failing `seed` so any
+counterexample replays exactly. `cargo-fuzz` would need nightly plus a
+separate workspace that re-creates the Soroban test `Env` from raw bytes.
+
+Each iteration puts the contract in front of a `CountingToken` double (it
+counts how many transfers reach it) and applies a random sequence of
+`add_to_allowlist` (with and without an `expiration_ledger`),
+`remove_from_allowlist`, ledger advances (so expiries actually lapse),
+`pause`/`unpause`, and `transfer` calls with random parties and amounts
+(including negative and `i128` extremes).
+
+Invariants checked after every step:
+
+1. **Forward only when both parties are allowlisted** — `transfer` reaches
+   the underlying token (and returns `Ok(true)`) only when the contract is
+   unpaused, `amount >= 0`, and both `from` and `to` are allowlisted *at call
+   time* (entry present and not past its `expiration_ledger`). In every other
+   case the underlying token's call counter must not change.
+2. **Error mapping** — negative amount → `InvalidInput`, paused →
+   `ContractPaused`, a non-allowlisted party → `Ok(false)`.
+3. **Model agreement** — `is_allowed(addr)` matches the harness's model for
+   every address.
+
+### Short run (default, also in `cargo test`)
+
+```sh
+cargo test -p allowlist-token fuzz_transfer_only_forwards_when_both_allowlisted -- --nocapture
+```
+
+Defaults: `FUZZ_ITERATIONS=128`, `FUZZ_OPS=24`. This bounded run is part of
+the regular workspace `cargo test`, so it runs in CI.
+
+### Periodic longer campaign (not in CI)
+
+```sh
+FUZZ_ITERATIONS=2000 FUZZ_OPS=64 \
+  cargo test -p allowlist-token fuzz_transfer_only_forwards_when_both_allowlisted -- --nocapture
+```
+
+Run this after non-trivial changes to `transfer`, `is_allowed`,
+`add_to_allowlist`, or `remove_from_allowlist`, or as part of a release
+checklist.
