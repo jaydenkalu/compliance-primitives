@@ -94,17 +94,21 @@ export interface RawEvent {
   source: string | null;
   /** Populated for ComplianceEvent: the free-form detail string */
   detail: string | null;
-  /** Populated for multisig-admin SignerAdd/SignerRm events */
-  signerAddress: string | null;
-  /** Populated for multisig-admin ThreshSet/AuthOk events */
-  newThreshold: number | null;
-  /** Populated for multisig-admin AuthOk events: number of valid signers counted */
-  validCount: number | null;
-  /** Populated for policy-engine PolicyResult events */
+  /**
+   * Populated for PolicyResult events: the `from` address evaluated by
+   * the policy engine (topics: [Symbol("PolicyResult"), Bool(passed)],
+   * data: Vec[Address(from), Address(to)]).
+   */
   policyFrom: string | null;
-  /** Populated for policy-engine PolicyResult events */
+  /**
+   * Populated for PolicyResult events: the `to` address evaluated by
+   * the policy engine.
+   */
   policyTo: string | null;
-  /** Populated for policy-engine PolicyResult events */
+  /**
+   * Populated for PolicyResult events: whether the policy evaluation
+   * passed (true) or failed (false).
+   */
   policyPassed: boolean | null;
   rawTopics: string;
   rawData: string;
