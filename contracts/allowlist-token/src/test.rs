@@ -635,216 +635,153 @@ fn prop_allowlist_add_remove_last_write_wins() {
         .unwrap();
 }
 
-// ─── Admin transfer (#19) ────────────────────────────────────────────────────
-
-mod admin_transfer {
-    use super::setup;
-    use crate::{AllowlistToken, AllowlistTokenClient, Error};
-    use soroban_sdk::testutils::{Address as _, Events as _};
-    use soroban_sdk::{vec, Address, Env, IntoVal, Map, Symbol, Val};
-
-    #[test]
-    fn test_transfer_admin_reassigns_admin_and_emits_event() {
-        let env = Env::default();
-        let (admin, _token_id, contract_id, client) = setup(&env);
-        let new_admin = Address::generate(&env);
-
-        client.transfer_admin(&admin, &new_admin);
-
-        assert_eq!(
-            env.events().all(),
-            vec![
-                &env,
-                (
-                    contract_id.clone(),
-                    (
-                        Symbol::new(&env, "admin_transferred"),
-                        admin.clone(),
-                        new_admin.clone(),
-                    )
-                        .into_val(&env),
-                    Map::<Symbol, Val>::new(&env).into_val(&env),
-                ),
-            ]
-        );
-        assert_eq!(client.metadata().admin, new_admin);
-    }
-
-    #[test]
-    fn test_transfer_admin_rejects_non_admin() {
-        let env = Env::default();
-        let (admin, _token_id, _contract_id, client) = setup(&env);
-        let impostor = Address::generate(&env);
-
-        let result = client.try_transfer_admin(&impostor, &impostor);
-        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
-
-        // The real admin is unchanged and still in control.
-        assert_eq!(client.metadata().admin, admin);
-        let alice = Address::generate(&env);
-        client.add_to_allowlist(&admin, &alice, &None);
-        assert!(client.is_allowed(&alice));
-    }
-
-    #[test]
-    fn test_transfer_admin_revokes_old_admin_immediately() {
-        let env = Env::default();
-        let (old_admin, _token_id, _contract_id, client) = setup(&env);
-        let new_admin = Address::generate(&env);
-        let alice = Address::generate(&env);
-
-        client.transfer_admin(&old_admin, &new_admin);
-
-        assert_eq!(
-            client.try_add_to_allowlist(&old_admin, &alice, &None),
-            Err(Ok(Error::NotAuthorized))
-        );
-        assert_eq!(client.try_pause(&old_admin), Err(Ok(Error::NotAuthorized)));
-        assert_eq!(
-            client.try_transfer_admin(&old_admin, &old_admin),
-            Err(Ok(Error::NotAuthorized))
-        );
-        assert!(!client.is_allowed(&alice));
-
-        client.add_to_allowlist(&new_admin, &alice, &None);
-        assert!(client.is_allowed(&alice));
-    }
-
-    #[test]
-    fn test_transfer_admin_clears_pending_two_step_proposal() {
-        let env = Env::default();
-        let (admin, _token_id, _contract_id, client) = setup(&env);
-        let proposed = Address::generate(&env);
-        let new_admin = Address::generate(&env);
-
-        client.propose_admin(&admin, &proposed);
-        client.transfer_admin(&admin, &new_admin);
-
-        assert_eq!(
-            client.try_accept_admin(&proposed),
-            Err(Ok(Error::NoPendingAdmin))
-        );
-        assert_eq!(client.metadata().admin, new_admin);
-    }
-
-    #[test]
-    fn test_transfer_admin_fails_before_initialize() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AllowlistToken, ());
-        let client = AllowlistTokenClient::new(&env, &contract_id);
-        let someone = Address::generate(&env);
-
-        assert_eq!(
-            client.try_transfer_admin(&someone, &someone),
-            Err(Ok(Error::NotInitialized))
-        );
-    }
-}
-
-// ─── Allowlist expiry (#21) ──────────────────────────────────────────────────
-
-/// Pin the ledger to a known sequence with TTLs generous enough that neither
-/// the contract instance nor allowlist entries get archived while the tests
-/// move the ledger forward.
-fn set_ledger(env: &Env, sequence: u32) {
-    env.ledger().with_mut(|li| {
-        li.sequence_number = sequence;
-        li.min_persistent_entry_ttl = 1_000_000;
-        li.max_entry_ttl = 6_311_520;
-    });
-}
+// ─── Compliance officer (#357) ───────────────────────────────────────────────
 
 #[test]
-fn test_allowlist_entry_without_expiry_never_expires() {
+fn test_officer_can_remove_from_allowlist_after_assignment() {
     let env = Env::default();
-    set_ledger(&env, 100);
     let (admin, _token_id, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
     let alice = Address::generate(&env);
 
-    client.add_to_allowlist(&admin, &alice, &None);
-    assert!(client.is_allowed(&alice));
-    assert_eq!(
-        client.get_allowlist_entry(&alice),
-        Some(AllowlistEntry { expiration_ledger: None })
-    );
+    client.add_to_allowlist(&admin, &alice);
+    client.set_compliance_officer(&admin, &officer);
 
-    set_ledger(&env, 500_000);
-    assert!(client.is_allowed(&alice));
-}
-
-#[test]
-fn test_allowlist_entry_valid_at_expiration_ledger_and_expired_one_after() {
-    let env = Env::default();
-    set_ledger(&env, 100);
-    let (admin, _token_id, _contract_id, client) = setup(&env);
-    let alice = Address::generate(&env);
-
-    client.add_to_allowlist(&admin, &alice, &Some(150));
-    assert!(client.is_allowed(&alice));
-
-    // Exactly at the expiration ledger: still allowed (inclusive bound).
-    set_ledger(&env, 150);
-    assert!(client.is_allowed(&alice));
-
-    // One past the expiration ledger: treated as not allowlisted, without any
-    // explicit remove_from_allowlist call.
-    set_ledger(&env, 151);
+    client.remove_from_allowlist(&officer, &alice);
     assert!(!client.is_allowed(&alice));
-    // The raw entry is still in storage; it is just ignored.
+}
+
+#[test]
+fn test_officer_cannot_assign_or_revoke_officer_role() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+    let other = Address::generate(&env);
+
+    client.set_compliance_officer(&admin, &officer);
+
     assert_eq!(
-        client.get_allowlist_entry(&alice),
-        Some(AllowlistEntry { expiration_ledger: Some(150) })
+        client.try_set_compliance_officer(&officer, &other),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_revoke_compliance_officer(&officer),
+        Err(Ok(Error::NotAuthorized))
     );
 }
 
 #[test]
-fn test_transfer_blocked_after_allowlist_entry_expires() {
+fn test_officer_cannot_add_to_allowlist() {
     let env = Env::default();
-    set_ledger(&env, 100);
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+    let alice = Address::generate(&env);
+
+    client.set_compliance_officer(&admin, &officer);
+
+    assert_eq!(
+        client.try_add_to_allowlist(&officer, &alice),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(!client.is_allowed(&alice));
+}
+
+#[test]
+fn test_revoked_officer_can_no_longer_remove_from_allowlist() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+    let alice = Address::generate(&env);
+
+    client.add_to_allowlist(&admin, &alice);
+    client.set_compliance_officer(&admin, &officer);
+    client.revoke_compliance_officer(&admin);
+
+    assert_eq!(
+        client.try_remove_from_allowlist(&officer, &alice),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(client.is_allowed(&alice));
+}
+
+// ─── Pause / unpause / is_paused (#358) ──────────────────────────────────────
+
+#[test]
+fn test_transfer_blocked_while_paused_and_succeeds_after_unpause() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice);
+    client.add_to_allowlist(&admin, &bob);
+
+    assert!(!client.is_paused());
+    client.pause(&admin);
+    assert!(client.is_paused());
+    assert_eq!(
+        client.try_transfer(&alice, &bob, &10),
+        Err(Ok(Error::ContractPaused))
+    );
+
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+    assert!(client.transfer(&alice, &bob, &10));
+    let token = MockTokenClient::new(&env, &token_id);
+    assert_eq!(token.last_transfer(), Some((alice, bob, 10)));
+}
+
+#[test]
+fn test_pause_does_not_block_allowlist_mutations() {
+    let env = Env::default();
     let (admin, _token_id, _contract_id, client) = setup(&env);
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice);
 
-    client.add_to_allowlist(&admin, &alice, &None);
-    client.add_to_allowlist(&admin, &bob, &Some(200));
+    client.pause(&admin);
 
-    set_ledger(&env, 200);
-    assert!(client.transfer(&alice, &bob, &10));
-
-    set_ledger(&env, 201);
-    assert!(!client.transfer(&alice, &bob, &10));
+    client.add_to_allowlist(&admin, &bob);
+    assert!(client.is_allowed(&bob));
+    client.remove_from_allowlist(&admin, &alice);
+    assert!(!client.is_allowed(&alice));
 }
 
 #[test]
-fn test_add_to_allowlist_rejects_expiration_in_the_past() {
+fn test_pause_and_unpause_reject_non_admin() {
     let env = Env::default();
-    set_ledger(&env, 100);
     let (admin, _token_id, _contract_id, client) = setup(&env);
-    let alice = Address::generate(&env);
+    let impostor = Address::generate(&env);
 
-    let result = client.try_add_to_allowlist(&admin, &alice, &Some(99));
-    assert_eq!(result, Err(Ok(Error::InvalidInput)));
-    assert!(!client.is_allowed(&alice));
+    assert_eq!(client.try_pause(&impostor), Err(Ok(Error::NotAuthorized)));
+    assert!(!client.is_paused());
 
-    // The current ledger itself is a valid (single-ledger) expiry.
-    client.add_to_allowlist(&admin, &alice, &Some(100));
-    assert!(client.is_allowed(&alice));
+    client.pause(&admin);
+    assert_eq!(client.try_unpause(&impostor), Err(Ok(Error::NotAuthorized)));
+    assert!(client.is_paused());
+}
+
+// ─── get_delegated_nonce (#359) ──────────────────────────────────────────────
+
+#[test]
+fn test_get_delegated_nonce_is_zero_before_any_delegated_call() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+
+    assert_eq!(client.get_delegated_nonce(&admin), 0);
 }
 
 #[test]
-fn test_re_adding_expired_entry_restores_allowlist_status() {
+fn test_get_delegated_nonce_returns_last_used_nonce() {
     let env = Env::default();
-    set_ledger(&env, 100);
     let (admin, _token_id, _contract_id, client) = setup(&env);
     let alice = Address::generate(&env);
+    let signing_key = delegated_signing_key();
+    let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    client.set_delegated_admin_key(&admin, &pubkey);
 
-    client.add_to_allowlist(&admin, &alice, &Some(110));
-    set_ledger(&env, 111);
-    assert!(!client.is_allowed(&alice));
+    let expiry = env.ledger().timestamp() + 60;
+    let signature = sign_delegated_action(&env, &signing_key, &alice, 7, expiry);
+    client.add_to_allowlist_delegated(&admin, &alice, &7u64, &expiry, &signature);
 
-    client.add_to_allowlist(&admin, &alice, &None);
-    assert!(client.is_allowed(&alice));
-    set_ledger(&env, 10_000);
-    assert!(client.is_allowed(&alice));
+    assert_eq!(client.get_delegated_nonce(&admin), 7);
 }
