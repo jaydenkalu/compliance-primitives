@@ -14,11 +14,20 @@
 //! **Composition**: deploy this contract in front of an issuer's real token
 //! and point clients at it instead of the underlying token — cleared
 //! transfers are forwarded on via a cross-contract call.
+//!
+//! **Roles**: there is a single privileged role, `admin`. Both
+//! `add_to_allowlist` and `remove_from_allowlist` are admin-only, and this
+//! contract has no compliance-officer role (that role exists only on
+//! `denylist-gate` and `jurisdiction-flag`). If an "officers may revoke but not
+//! grant" split is ever wanted here, it must be added deliberately, with
+//! `add_to_allowlist` staying admin-only.
 #![no_std]
 
+extern crate alloc;
+
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, BytesN,
-    Env, String,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
+    BytesN, Env, String, Symbol,
 };
 
 /// Extend a persistent allowlist entry when its remaining TTL drops below
@@ -37,30 +46,10 @@ enum DataKey {
     Allowed(Address),
     Paused,
     PendingAdmin,
-    PendingUpgrade,
-}
-
-/// Delayed contract-upgrade proposal state used by `propose_upgrade` and
-/// `commit_upgrade`.
-#[contracttype]
-#[derive(Clone)]
-pub struct UpgradeState {
-    pub new_wasm: BytesN<32>,
-    pub activated_at: u64,
-}
-
-/// Schema version tracked by this contract instance for migration/audit tooling.
-pub const SCHEMA_VERSION: u32 = 1;
-
-/// Value stored under `DataKey::Allowed(address)`.
-///
-/// `expiration_ledger` is the last ledger sequence (inclusive) at which the
-/// address is still treated as allowlisted. `None` means the entry never
-/// expires and stays valid until an explicit `remove_from_allowlist`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AllowlistEntry {
-    pub expiration_ledger: Option<u32>,
+    /// ed25519 public key allowed to authorize delegated admin actions.
+    DelegatedAdminPubKey,
+    /// Last accepted delegated-action nonce for an admin. Persistent storage.
+    DelegatedNonce(Address),
 }
 
 #[contractevent]
@@ -124,7 +113,10 @@ pub enum Error {
     ContractPaused = 5,
     NoPendingAdmin = 6,
     PendingAdminMismatch = 7,
-    UpgradeNotReady = 8,
+    DelegationNotConfigured = 8,
+    InvalidSignature = 9,
+    InvalidNonce = 10,
+    ExpiredSignature = 11,
 }
 
 #[contract]
@@ -158,23 +150,34 @@ impl AllowlistToken {
         })
     }
 
-    /// Add `address` to the allowlist. Admin-only.
-    ///
-    /// `expiration_ledger` optionally bounds how long the entry stays valid:
-    ///
-    /// - `None` — the address stays allowlisted until `remove_from_allowlist`.
-    /// - `Some(n)` — the address is allowlisted while the current ledger
-    ///   sequence is `<= n` and automatically treated as not allowlisted from
-    ///   ledger `n + 1` onward, with no explicit removal required.
-    ///
-    /// Re-adding an address overwrites its previous expiry. Returns
-    /// `Error::InvalidInput` if `expiration_ledger` is already in the past.
-    pub fn add_to_allowlist(
+    /// Configure the ed25519 public key that may authorize delegated admin
+    /// actions without the admin account itself needing to submit the
+    /// transaction. The direct-auth path remains unchanged and still uses
+    /// `admin.require_auth()`. Admin-only.
+    pub fn set_delegated_admin_key(
         env: Env,
         admin: Address,
-        address: Address,
-        expiration_ledger: Option<u32>,
+        pubkey: BytesN<32>,
     ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::DelegatedAdminPubKey, &pubkey);
+        Ok(())
+    }
+
+    /// Add `address` to the allowlist. Admin-only.
+    ///
+    /// Granting access is deliberately stricter than revoking it in intent:
+    /// putting an address on the allowlist lets it receive and send the
+    /// wrapped token, so it is restricted to the `admin` (directly, or through
+    /// `add_to_allowlist_delegated`). `remove_from_allowlist` is also
+    /// admin-only today — this contract has no compliance-officer role, so
+    /// there is no add/remove asymmetry to preserve. Do not "unify" the two
+    /// gates without deciding that explicitly: if a compliance-officer role is
+    /// introduced, the intended shape is that officers may revoke access but
+    /// never grant it, so `add_to_allowlist` must stay admin-only.
+    pub fn add_to_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         if let Some(exp) = expiration_ledger {
             if exp < env.ledger().sequence() {
@@ -194,7 +197,68 @@ impl AllowlistToken {
         Ok(())
     }
 
+    /// Add `address` to the allowlist using a signed off-chain authorization
+    /// payload. This path verifies a nonce and expiry before applying the
+    /// allowlist change, so a relayer can submit it on behalf of the admin.
+    pub fn add_to_allowlist_delegated(
+        env: Env,
+        admin: Address,
+        address: Address,
+        nonce: u64,
+        expiry: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        Self::require_configured_admin(&env, &admin)?;
+
+        let now = env.ledger().timestamp();
+        if expiry <= now {
+            return Err(Error::ExpiredSignature);
+        }
+
+        let last_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegatedNonce(admin.clone()))
+            .unwrap_or(0);
+        if nonce <= last_nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        let pubkey: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegatedAdminPubKey)
+            .ok_or(Error::DelegationNotConfigured)?;
+        let action = Symbol::new(&env, "add_to_allowlist");
+        let message = Self::delegated_action_message(&env, &address, &action, nonce, expiry);
+        match soroban_sdk::env::internal::Env::verify_sig_ed25519(
+            &env,
+            pubkey.to_object(),
+            message.to_object(),
+            signature.to_object(),
+        ) {
+            Ok(_) => {}
+            Err(_) => return Err(Error::NotAuthorized),
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegatedNonce(admin), &nonce);
+        let key = DataKey::Allowed(address.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            ALLOWED_TTL_THRESHOLD,
+            ALLOWED_TTL_EXTEND_TO,
+        );
+        AllowAdd { address }.publish(&env);
+        Ok(())
+    }
+
     /// Remove `address` from the allowlist. Admin-only.
+    ///
+    /// Same gate as `add_to_allowlist` (`require_admin`); see the note there
+    /// on why revocation must not be widened to other roles by accident.
     pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage()
@@ -439,6 +503,10 @@ impl AllowlistToken {
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_configured_admin(env, admin)
+    }
+
+    fn require_configured_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -449,10 +517,34 @@ impl AllowlistToken {
         }
         Ok(())
     }
+
+    /// Message signed by the delegated admin key:
+    /// `allowlist-delegated-v1:<target>:<action>:<nonce>:<expiry>`.
+    fn delegated_action_message(
+        env: &Env,
+        target: &Address,
+        action: &Symbol,
+        nonce: u64,
+        expiry: u64,
+    ) -> Bytes {
+        let mut message = Bytes::new(env);
+        message.append(&Bytes::from_slice(env, b"allowlist-delegated-v1:"));
+        let target_str = target.to_string().to_string();
+        message.append(&Bytes::from_slice(env, target_str.as_bytes()));
+        message.push_back(b':');
+        let action_str = action.to_string().to_string();
+        message.append(&Bytes::from_slice(env, action_str.as_bytes()));
+        message.push_back(b':');
+        let nonce_str = alloc::format!("{nonce}");
+        message.append(&Bytes::from_slice(env, nonce_str.as_bytes()));
+        message.push_back(b':');
+        let expiry_str = alloc::format!("{expiry}");
+        message.append(&Bytes::from_slice(env, expiry_str.as_bytes()));
+        message
+    }
 }
 
 #[cfg(test)]
 mod test;
-
 #[cfg(test)]
-mod fuzz;
+mod fuzz_test;
