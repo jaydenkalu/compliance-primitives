@@ -44,56 +44,14 @@ Run this after non-trivial changes to `set_jurisdiction` /
 `get_jurisdiction` / `is_permitted_jurisdiction`, or as part of a release
 checklist. Failures print the failing `seed` so the sequence is reproducible.
 
-Multi-code add/remove operations are also fuzzed against a fixed code-pool
-set model:
+### Expiring jurisdiction entries (#397)
 
-```sh
-cargo test -p jurisdiction-flag fuzz_jurisdiction_multicode_add_remove_sequences -- --nocapture
-```
-
-This target uses the same `FUZZ_ITERATIONS` and `FUZZ_OPS` controls and checks
-that each operation leaves `list_jurisdictions` equal to the modeled set.
-
-## circuit-breaker × denylist-gate-consumer (`#465`)
-
-Harness: `examples/denylist-gate-consumer/src/fuzz_test.rs`
-
-Fuzzes the **composition** of `circuit-breaker` and `denylist-gate` inside a
-consumer token's transfer path — the integration-level scenario that
-single-contract harnesses cannot cover.  Random `freeze`/`unfreeze`,
-`add_to_denylist`/`remove_from_denylist`, and `transfer` calls are interleaved
-in arbitrary order.
-
-Invariants checked after every `transfer` attempt:
-
-1. **Frozen gate always blocks** — while `is_frozen()` is `true`, every
-   `transfer` must return `Err(FrozenByBreaker)`.
-2. **Unfrozen + denied still blocks** — `Err(DeniedByGate)` only fires when
-   unfrozen and at least one party is denied.
-3. **Unfrozen + both clear allows** — a `transfer` that returns `Ok(())` must
-   only occur when unfrozen and neither party is denied.
-4. **Balances never mutate through a blocked transfer** — any rejected transfer
-   leaves sender and recipient balances unchanged.
-5. **No panic** — no op sequence causes a host panic.
-
-### Short run (default, also in `cargo test`)
-
-```sh
-cargo test -p denylist-gate-consumer fuzz_circuit_breaker_consumer_composition
-```
-
-Defaults: `FUZZ_ITERATIONS=500`, `FUZZ_OPS=32`.
-
-### Periodic longer campaign (not in CI)
-
-```sh
-FUZZ_ITERATIONS=2000 FUZZ_OPS=64 \
-  cargo test -p denylist-gate-consumer fuzz_circuit_breaker_consumer_composition -- --nocapture
-```
-
-Run this after non-trivial changes to `circuit-breaker`, `denylist-gate`, or
-the consumer transfer path.  Failures print the failing `seed` for
-reproducibility.
+Boundary fuzz coverage for `set_jurisdiction_until` is blocked: the current
+contract has no such entrypoint, `valid_until` value, or expiry storage. Once
+expiry semantics are implemented, add checks for `valid_until` equal to zero,
+the current ledger sequence, values near `u32::MAX`, and randomized values;
+assert that only the documented `Error` results are returned for invalid
+boundaries. See #397 for the requested follow-up.
 
 ## policy-engine (`#234`)
 
