@@ -360,3 +360,46 @@ fn test_duplicate_source_event_pair_produces_two_entries() {
         "the cross-ledger duplicate must record the new ledger sequence"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Negative-auth tests — issue #462
+//
+// `pause` and `unpause` are admin-gated.  A caller whose address does not
+// match the stored admin must receive `Error::NotAuthorized`.
+// ---------------------------------------------------------------------------
+
+/// `pause` must return `Err(Error::NotAuthorized)` when called by an address
+/// that is not the stored admin.
+#[test]
+fn test_pause_rejects_non_admin() {
+    let env = Env::default();
+    let (_admin, _contract_id, client) = setup(&env);
+
+    let impostor = Address::generate(&env);
+    let result = client.try_pause(&impostor);
+    assert_eq!(
+        result,
+        Err(Ok(Error::NotAuthorized)),
+        "pause must reject a non-admin caller"
+    );
+}
+
+/// `unpause` must return `Err(Error::NotAuthorized)` when called by an
+/// address that is not the stored admin, even when the contract is paused.
+#[test]
+fn test_unpause_rejects_non_admin() {
+    let env = Env::default();
+    let (admin, _contract_id, client) = setup(&env);
+
+    // Pause the contract first (using the legitimate admin) so that the
+    // unpause path is reachable.
+    client.pause(&admin);
+
+    let impostor = Address::generate(&env);
+    let result = client.try_unpause(&impostor);
+    assert_eq!(
+        result,
+        Err(Ok(Error::NotAuthorized)),
+        "unpause must reject a non-admin caller"
+    );
+}

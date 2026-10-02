@@ -853,3 +853,144 @@ fn test_get_check_out_of_range_returns_error() {
         "expected Err(CheckIndexOutOfRange) for index 1 with only 1 check registered"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Negative-auth tests — issue #462
+//
+// Every admin-gated mutation must reject a caller that is not the stored
+// admin with `Error::NotAuthorized`.  We use `mock_all_auths()` so that
+// Soroban's auth framework does not reject the call before our own admin
+// check runs, which lets us test the *contract-level* guard in isolation.
+// ---------------------------------------------------------------------------
+
+/// `add_check` must return `Err(Error::NotAuthorized)` when called by an
+/// address that is not the stored admin.
+#[test]
+fn test_add_check_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let (_, _engine_id, client) = setup_engine_all(&env);
+    let impostor = Address::generate(&env);
+
+    let result = client.try_add_check(
+        &impostor,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    assert_eq!(
+        result,
+        Err(Ok(Error::NotAuthorized)),
+        "add_check must reject a non-admin caller"
+    );
+}
+
+/// `remove_check` must return `Err(Error::NotAuthorized)` when called by a
+/// non-admin, even when a check exists at the requested index.
+#[test]
+fn test_remove_check_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    // Register one check so the index is valid.
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+
+    let impostor = Address::generate(&env);
+    let result = client.try_remove_check(&impostor, &0u32);
+    assert_eq!(
+        result,
+        Err(Ok(Error::NotAuthorized)),
+        "remove_check must reject a non-admin caller"
+    );
+}
+
+/// `swap_checks` must return `Err(Error::NotAuthorized)` when called by a
+/// non-admin, even when both indices are valid.
+#[test]
+fn test_swap_checks_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    // Register two checks so both indices 0 and 1 are valid.
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+
+    let impostor = Address::generate(&env);
+    let result = client.try_swap_checks(&impostor, &0u32, &1u32);
+    assert_eq!(
+        result,
+        Err(Ok(Error::NotAuthorized)),
+        "swap_checks must reject a non-admin caller"
+    );
+}
+
+/// `clear_checks` must return `Err(Error::NotAuthorized)` when called by a
+/// non-admin.
+#[test]
+fn test_clear_checks_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    // Register a check so there is something to clear.
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+
+    let impostor = Address::generate(&env);
+    let result = client.try_clear_checks(&impostor);
+    assert_eq!(
+        result,
+        Err(Ok(Error::NotAuthorized)),
+        "clear_checks must reject a non-admin caller"
+    );
+}
+
+/// `set_circuit_breaker` must return `Err(Error::NotAuthorized)` when called
+/// by a non-admin.
+#[test]
+fn test_set_circuit_breaker_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, _engine_id, client) = setup_engine_all(&env);
+    let impostor = Address::generate(&env);
+    let fake_breaker = Address::generate(&env);
+
+    let result = client.try_set_circuit_breaker(&impostor, &fake_breaker);
+    assert_eq!(
+        result,
+        Err(Ok(Error::NotAuthorized)),
+        "set_circuit_breaker must reject a non-admin caller"
+    );
+}
